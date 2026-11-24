@@ -86,8 +86,27 @@ def build_message(label: str, payload: dict) -> str:
     status = payload.get("status")
     upload = payload.get("upload")
     if status == "ok" and upload in (None, "ok"):
-        head = f"✅ {label} สำเร็จ"
-    elif status == "ok":
+        # ข้อความตอนสำเร็จแบบย่อ - ชื่อรายงานเอาจากท้ายของ label ("BOTR05105 · R05.105")
+        report = label.split("·")[-1].strip() or label
+        outputs = payload.get("outputs") or []
+        folder = str(Path(outputs[0].get("path", "")).parent) if outputs else ""
+        project = str(Path(__file__).resolve().parents[1])
+        lines = [
+            f"✅ ส่งออกไฟล์ {report} สำเร็จ",
+            f"โดยบอทจากโฟลเดอร์ \"{project}\"",
+            f"เครื่อง: {os.environ.get('COMPUTERNAME') or socket.gethostname()}",
+            f"เวลา: {_fmt_time(payload.get('started_at'))} "
+            f"({payload.get('duration_seconds', 0):.0f} วินาที)",
+        ]
+        for out in outputs:
+            lines.append(f"ไฟล์: {Path(out.get('path', '')).name} "
+                         f"({_fmt_size(int(out.get('size', 0)))})")
+        if folder:
+            lines.append(f"โฟลเดอร์ปลายทาง: \"{folder}\"")
+        lines.append("สำหรับอัปเดทราคาหน้า Price โปรแกรม Anin-Label")
+        lines.append("Repo: https://github.com/it-anin/botr05105")
+        return "\n".join(lines)[:MAX_TEXT]
+    if status == "ok":
         head = (f"⚠️ {label} export สำเร็จ แต่อัปโหลด"
                 + ("ข้ามรอบ (ไฟล์ไม่ได้อัปเดต)" if upload == "skipped" else "ไม่สำเร็จ"))
     elif status == "already_running":
