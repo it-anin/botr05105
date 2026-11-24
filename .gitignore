@@ -1,0 +1,23 @@
+# ความลับ - ห้าม commit
+.env
+secrets.yaml
+
+# ผลลัพธ์การรัน
+logs/
+screenshots/
+*.log
+
+# Node (ส่วนอัปโหลด Supabase — upload-products.mjs)
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ผลลัพธ์การ build .exe (สร้างใหม่ได้ด้วย .\tools\build_exe.ps1)
+build/
+dist/
+*.spec.bak

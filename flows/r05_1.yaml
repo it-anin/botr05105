@@ -1,0 +1,53 @@
+# กดเครื่องหมาย + หน้า R05.1 รายละเอียดสินค้า เพื่อขยายดูรายงานย่อย (หา R05.105)
+#
+# รายการรายงานทางซ้ายเป็น DataWindow control_id=1010 แถวสูง 27px เท่ากันหมด
+#     x = 16    กล่องเครื่องหมาย + (ปุ่มขยาย) กว้าง 9px อยู่ค่อนบนของแถว
+#               (ขอบบนแถว +3 ถึง +11px) คลิกกลางแถวจะเลยใต้กล่องไป
+#
+# ห้ามกดตามเลขแถว (สูตรเดิม y = 8 + 27 * ลำดับแถว) เพราะรายการเพิ่ม/ลดแถวเองได้
+# เช่นวันที่ 26/09 มีแถว "R16.1 ปรับขนาด-เพิ่มเติม" โผล่เพิ่มที่แถว 3 ทำให้ R05.1
+# เลื่อนจากแถว 10 ไปแถว 11 แล้วบอทไปกด + ของ R04.4 แทน
+#
+# จึงใช้ dw_click_row หาแถวจากภาพข้อความ flows/refs/r05_1.png ทุกครั้งก่อนกด
+# หาไม่เจอหรือเจอหลายที่จะหยุดทันที ไม่กดเดา
+#     find_x = 31   ขอบซ้ายของภาพอ้างอิงในพิกัด DataWindow (ตรงตัว "R" ของ R05.1)
+#     click_dy = 7  กลางกล่อง + นับจากขอบบนของแถว (ภาพอ้างอิงตัดเต็มความสูงแถว)
+
+name: r05_1
+description: ล็อกอินแล้วกด + หน้า R05.1 รายละเอียดสินค้า
+on_error: abort
+
+steps:
+  - action: run_flow
+    name: เข้าสู่ระบบ
+    path: flows/login.yaml
+
+  - action: wait_window
+    name: จับหน้าจอหลักไว้อ้างอิง
+    as: main
+    timeout: 60
+    window:
+      class_name: "FNWND3125"
+      title: "Report Seniorsoft ProMaxx"
+
+  - action: screenshot
+    name: 01_before_expand
+    window: main
+
+  # ตรวจทั้ง DataWindow ว่าเปลี่ยน (แถวข้างล่างเลื่อนลง) - ส่วนการยืนยันว่า
+  # ขยายถูกกลุ่มจริงอยู่ที่ flows/r05_105.yaml ซึ่งจะหาแถว R05.105 ไม่เจอถ้าขยายผิด
+  - action: dw_click_row
+    name: กด + หน้า R05.1 รายละเอียดสินค้า
+    window: main
+    datawindow: { class_name: "pbdw125", control_id: 1010 }
+    find: flows/refs/r05_1.png
+    find_x: 31
+    click_x: 16
+    click_dy: 7
+    expect_change: true
+    change_timeout: 5
+    alert: "เลือกเมนูไม่ได้: หาเมนู R05.1 ไม่เจอหรือกด + แล้วไม่ขยาย - ProMaxx อาจอัปเดตหน้าตาเมนู ดูภาพที่แนบ แล้วทำภาพอ้างอิงใหม่ใน flows/refs (HOWTO ข้อ 4.2)"
+
+  - action: screenshot
+    name: 02_after_expand
+    window: main

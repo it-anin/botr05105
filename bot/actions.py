@@ -1,0 +1,718 @@
+"""ทะเบียน action ที่เรียกใช้ได้จากไฟล์ flow YAML
+
+ทุก action รับ (ctx, step) โดย step คือ mapping หนึ่งรายการในลิสต์ steps
+คีย์ที่ทุก action ใช้ร่วมกัน: action, name, retry, optional, timeout, pause, alert
+(alert = หัวข้อแจ้งเตือนที่จะส่งเข้า Telegram ถ้า step นี้ทำให้ทั้งรอบล้ม)
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Callable
+
+from . import datawindow as dw
+from . import watch, win
+from .context import Context, StepError
+from .logging_setup import get_logger
+
+log = get_logger()
+
+REGISTRY: dict[str, Callable[[Context, dict], None]] = {}
+ALLOWED_KEYS: dict[str, set[str]] = {}
+
+COMMON_KEYS = {"action", "name", "retry", "optional", "timeout", "pause", "alert"}
+
+
+def action(name: str, keys: tuple[str, ...] = ()):
+    def decorate(fn):
+        REGISTRY[name] = fn
+        ALLOWED_KEYS[name] = set(keys) | COMMON_KEYS
+        return fn
+
+    return decorate
+
+
+DRY_RUN_MAX_WAIT = 5.0
+
+
+def _timeout(ctx: Context, step: dict) -> float:
+    value = float(step.get("timeout", ctx.default_timeout))
+    # ตอน dry-run ไม่มีการกดจริง สถานะจึงไม่มีทางเปลี่ยน - ไม่ต้องรอนาน
+    return min(value, DRY_RUN_MAX_WAIT) if ctx.dry_run else value
+
+
+def _target(ctx: Context, step: dict, *, control_key: str = "control") -> tuple[int, int]:
+    """คืน (hwnd หน้าต่าง, hwnd control) - ถ้าไม่ระบุ control จะใช้หน้าต่างเอง"""
+    window = ctx.resolve_window(step.get("window"), timeout=_timeout(ctx, step))
+    spec = step.get(control_key)
+    if spec is None:
+        return window, window
+    return window, ctx.resolve_control(window, spec, timeout=_timeout(ctx, step),
+                                       key=control_key)
+
+
+def _describe(hwnd: int) -> str:
+    return (f"{hex(hwnd)} cls={win.get_class(hwnd)!r} "
+            f"id={win.get_ctrl_id(hwnd)} title={win.get_text(hwnd)!r}")
+
+
+# --------------------------------------------------------------- โปรแกรม
+
+
+@action("launch_app", ("if_running",))
+def act_launch_app(ctx: Context, step: dict) -> None:
+    """เปิดหรือเกาะโปรแกรม (if_running: attach | restart | fail)"""
+    policy = step.get("if_running", "attach")
+    if ctx.dry_run and policy == "restart":
+        log.info("dry-run: ข้ามการปิดโปรแกรมเดิม จะเกาะตัวที่เปิดอยู่แทน")
+        policy = "attach"
+    ctx.app.start_or_attach(policy)
+    ctx.app.wait_first_window(timeout=_timeout(ctx, step) if "timeout" in step else None)
+
+
+@action("stop_app")
+def act_stop_app(ctx: Context, step: dict) -> None:
+    """ปิดโปรแกรม (ล้มถ้าปิดไม่ลงจริง)"""
+    if ctx.dry_run:
+        log.info("dry-run: ข้ามการปิดโปรแกรม")
+        return
+    closed = ctx.app.stop()
+    # เคลียร์ pid กัน step ถัดไปเผลออ้างถึง process ที่ตายแล้ว
+    ctx.app.pid = None
+    ctx.windows.clear()
+    log.info("ปิดโปรแกรมแล้ว (%d process)", closed)
+
+
+# --------------------------------------------------------------- หน้าต่าง
+
+
+def _abort_checker(ctx: Context, spec: Any):
+    """คืนฟังก์ชันที่โยน StepError ทันทีถ้ามีหน้าต่างที่บ่งบอกความล้มเหลวโผล่ขึ้นมา
+
+    ใช้กับ abort_if: ในไฟล์ flow เช่นดักกล่องข้อความเตือนของ ProMaxx
+    เพื่อให้รู้ผลทันทีแทนที่จะรอจนหมด timeout
+    """
+    if not spec:
+        return lambda: None
+
+    from . import locators
+
+    pid = ctx.require_pid()
+
+    def check() -> None:
+        for hwnd in locators.find_windows(pid, spec):
+            messages = [
+                win.get_text(c) for c in win.child_windows(hwnd)
+                if win.get_class(c) == "Static" and win.get_text(c).strip()
+            ]
+            raise StepError(
+                f"เจอหน้าต่างที่บอกว่าล้มเหลว: {_describe(hwnd)}\n"
+                f"  ข้อความจากโปรแกรม: {' | '.join(messages) or '(ไม่มีข้อความ)'}"
+            )
+
+    return check
+
+
+@action("wait_window", ("window", "as", "abort_if"))
+def act_wait_window(ctx: Context, step: dict) -> None:
+    """รอหน้าต่างที่ตรงสเปก แล้วตั้งชื่อไว้อ้างอิงด้วย as:"""
+    from . import locators
+
+    check_abort = _abort_checker(ctx, step.get("abort_if"))
+    ref = step.get("window")
+    timeout = _timeout(ctx, step)
+
+    if isinstance(ref, dict):
+        pid = ctx.require_pid()
+        deadline = time.monotonic() + timeout
+        hwnd = None
+        while True:
+            check_abort()
+            found = locators.find_windows(pid, ref)
+            if found:
+                hwnd = found[0]
+                break
+            if time.monotonic() >= deadline:
+                raise StepError(
+                    f"หมดเวลา {timeout:.0f} วินาที ระหว่างรอหน้าต่างที่ตรงสเปก {ref}\n"
+                    f"  หน้าต่างที่มีอยู่จริงตอนนี้:\n{locators.describe_windows(pid)}"
+                )
+            time.sleep(ctx.poll_interval)
+    else:
+        hwnd = ctx.resolve_window(ref, timeout=timeout)
+
+    log.info("พบหน้าต่าง: %s", _describe(hwnd))
+    alias = step.get("as")
+    if alias:
+        ctx.windows[str(alias)] = hwnd
+
+
+@action("wait_window_gone", ("window", "abort_if"))
+def act_wait_window_gone(ctx: Context, step: dict) -> None:
+    """รอจนหน้าต่างปิดหรือถูกซ่อน (ถ้าปิดไปแล้วถือว่าผ่าน)"""
+    from . import locators
+
+    if ctx.dry_run:
+        log.info("dry-run: ข้ามการรอให้หน้าต่างปิด (ยังไม่ได้กดอะไรจริง)")
+        return
+
+    ref = step.get("window")
+    timeout = _timeout(ctx, step)
+    check_abort = _abort_checker(ctx, step.get("abort_if"))
+
+    if isinstance(ref, str):
+        if ref not in ctx.windows:
+            raise StepError(f"ยังไม่มีหน้าต่างชื่อ {ref!r} ที่จะรอให้ปิด")
+        hwnd = ctx.windows[ref]
+        if not win.exists(hwnd):
+            log.info("หน้าต่าง %r ปิดไปก่อนหน้านี้แล้ว", ref)
+            return
+    elif isinstance(ref, dict):
+        found = locators.find_windows(ctx.require_pid(), ref)
+        if not found:
+            log.info("ไม่พบหน้าต่างที่ตรงสเปกตั้งแต่แรก ถือว่าปิดแล้ว")
+            return
+        hwnd = found[0]
+    else:
+        hwnd = ctx.resolve_window(ref, timeout=timeout)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        check_abort()
+        if not win.exists(hwnd) or not win.is_visible(hwnd):
+            log.info("หน้าต่าง %s ปิดแล้ว", hex(hwnd))
+            return
+        if time.monotonic() >= deadline:
+            raise StepError(
+                f"หมดเวลา {timeout:.0f} วินาที ระหว่างรอให้หน้าต่างปิด\n"
+                f"  หน้าต่างยังอยู่: {_describe(hwnd)}\n"
+                f"  ถ้าเป็นหน้าล็อกอิน แปลว่าอาจกรอกรหัสผิดหรือปุ่มยังไม่ถูกกด"
+            )
+        time.sleep(ctx.poll_interval)
+
+
+@action("close_window", ("window",))
+def act_close_window(ctx: Context, step: dict) -> None:
+    """สั่งปิดหน้าต่างด้วย WM_CLOSE"""
+    hwnd = ctx.resolve_window(step.get("window"), timeout=_timeout(ctx, step))
+    if ctx.dry_run:
+        log.info("dry-run: จะปิดหน้าต่าง %s", _describe(hwnd))
+        return
+    win.close_window(hwnd)
+
+
+@action("wait_control", ("window", "control", "state"))
+def act_wait_control(ctx: Context, step: dict) -> None:
+    """รอให้ control อยู่ในสถานะที่ต้องการ (exists | visible | enabled | gone)"""
+    state = str(step.get("state", "visible")).lower()
+    window = ctx.resolve_window(step.get("window"), timeout=_timeout(ctx, step))
+    spec = step.get("control")
+    if spec is None:
+        raise StepError("wait_control ต้องระบุ 'control'")
+    timeout = _timeout(ctx, step)
+
+    from . import locators
+
+    def probe():
+        found = locators.find_controls(window, {**spec, "visible": "any"})
+        if state == "gone":
+            return True if not found else None
+        if not found:
+            return None
+        hwnd = found[0]
+        if state == "exists":
+            return hwnd
+        if state == "visible":
+            return hwnd if win.is_visible(hwnd) else None
+        if state == "enabled":
+            return hwnd if win.is_enabled(hwnd) else None
+        raise StepError(f"ไม่รู้จัก state {state!r} (ใช้ exists/visible/enabled/gone)")
+
+    try:
+        win.wait_until(probe, timeout, ctx.poll_interval,
+                       what=f"control {spec} อยู่ในสถานะ {state}")
+    except win.TimeoutExpired as exc:
+        from . import locators as loc
+        raise StepError(f"{exc}\n  control ที่มีอยู่จริง:\n{loc.describe(window)}") from exc
+    log.info("control %s อยู่ในสถานะ %s แล้ว", spec, state)
+
+
+# --------------------------------------------------------------- กด/พิมพ์
+
+# คีย์ที่ใช้ตรวจว่าการกดมีผลจริง - ใช้ร่วมกันทั้ง click และ dw_click
+CHANGE_KEYS = ("expect_change", "change_region", "change_timeout",
+               "change_min_pixels", "change_window", "change_control")
+
+
+def _resolve_watch(ctx: Context, step: dict) -> int | None:
+    """หา hwnd ที่จะเฝ้าดูการเปลี่ยนแปลง - None แปลว่าใช้เป้าหมายของการกดเอง
+
+    ใส่ change_window อย่างเดียว = เฝ้าทั้งหน้าต่างนั้น
+    ใส่ change_control อย่างเดียว = หา control ในหน้าต่างของ step นั้น
+    ใส่ทั้งคู่ = หา control ในหน้าต่างที่ระบุ (ใช้เมื่อผลไปโผล่คนละหน้าต่างกับที่กด)
+    """
+    has_window = "change_window" in step
+    has_control = "change_control" in step
+    if not has_window and not has_control:
+        return None
+
+    timeout = _timeout(ctx, step)
+    window = ctx.resolve_window(
+        step["change_window"] if has_window else step.get("window"),
+        timeout=timeout,
+    )
+    if not has_control:
+        return window
+    return ctx.resolve_control(window, step["change_control"],
+                               timeout=timeout, key="change_control")
+
+
+def _make_watcher(ctx: Context, step: dict, default_hwnd: int):
+    """สร้างตัวเฝ้าดูตามคีย์ change_* ใน step - None ถ้าไม่ได้ขอให้ตรวจ"""
+    if not step.get("expect_change"):
+        return None
+    hwnd = _resolve_watch(ctx, step) or default_hwnd
+    label = ("เป้าหมายที่กด" if hwnd == default_hwnd
+             else f"หน้าต่าง/control {hex(hwnd)}")
+    return watch.ChangeWatcher(
+        hwnd,
+        region=step.get("change_region"),
+        min_pixels=int(step.get("change_min_pixels",
+                                watch.DEFAULT_MIN_CHANGED_PIXELS)),
+        label=label,
+    )
+
+
+@action("click", ("window", "control", "method") + CHANGE_KEYS)
+def act_click(ctx: Context, step: dict) -> None:
+    """กด control (method: message | bm | center)"""
+    _, hwnd = _target(ctx, step)
+    method = str(step.get("method", "message")).lower()
+    if method not in ("bm", "message", "center"):
+        raise StepError(f"ไม่รู้จัก method {method!r} (ใช้ message หรือ bm)")
+
+    if ctx.dry_run:
+        log.info("dry-run: จะกด (%s) %s%s", method, _describe(hwnd),
+                 " พร้อมตรวจว่าหน้าจอเปลี่ยนจริง" if step.get("expect_change") else "")
+        return
+
+    watcher = _make_watcher(ctx, step, hwnd)
+    armed = watcher.arm() if watcher else False
+
+    log.info("กด (%s) %s", method, _describe(hwnd))
+    if method == "bm":
+        win.click_bm(hwnd)
+    else:
+        win.click_center(hwnd)
+
+    if armed:
+        watcher.wait(timeout=float(step.get("change_timeout", 5)),
+                     context=f"หลังกด {_describe(hwnd)}")
+
+
+@action("set_text", ("window", "control", "value", "method", "verify"))
+def act_set_text(ctx: Context, step: dict) -> None:
+    """ใส่ข้อความลง control (method: settext | chars)"""
+    _, hwnd = _target(ctx, step)
+    value = str(step.get("value", ""))
+    method = str(step.get("method", "settext")).lower()
+    if ctx.dry_run:
+        log.info("dry-run: จะใส่ข้อความยาว %d ตัวลง %s", len(value), _describe(hwnd))
+        return
+    log.info("ใส่ข้อความยาว %d ตัว (%s) ลง %s", len(value), method, _describe(hwnd))
+    dw.write_cell(hwnd, value, method=method)
+    _verify_text(hwnd, value, step)
+
+
+def _verify_text(hwnd: int, expected: str, step: dict) -> None:
+    if not step.get("verify", True):
+        return
+    if dw.is_password_edit(hwnd):
+        log.debug("ช่องรหัสผ่าน - ข้ามการอ่านค่ากลับ (วินโดวส์ไม่ให้อ่านข้ามโปรเซส)")
+        return
+    time.sleep(0.15)
+    actual = win.get_text(hwnd)
+    if actual != expected:
+        raise StepError(
+            f"ใส่ข้อความแล้วอ่านกลับไม่ตรง: คาดว่า {expected!r} แต่ได้ {actual!r}\n"
+            f"  control: {_describe(hwnd)}\n"
+            f"  ลองเปลี่ยนเป็น method: chars ในไฟล์ flow"
+        )
+
+
+@action("send_key", ("window", "control", "key", "repeat"))
+def act_send_key(ctx: Context, step: dict) -> None:
+    """ส่งปุ่มเดียวไปยัง control (ENTER, TAB, F5, ...)"""
+    key = step.get("key")
+    if not key:
+        raise StepError("send_key ต้องระบุ 'key'")
+    _, hwnd = _target(ctx, step)
+    repeat = int(step.get("repeat", 1))
+    if ctx.dry_run:
+        log.info("dry-run: จะส่งปุ่ม %s x%d ไปยัง %s", key, repeat, _describe(hwnd))
+        return
+    log.info("ส่งปุ่ม %s x%d ไปยัง %s", key, repeat, _describe(hwnd))
+    for _ in range(repeat):
+        win.send_key(hwnd, key)
+        time.sleep(0.08)
+
+
+@action("send_keys", ("window", "control", "keys"))
+def act_send_keys(ctx: Context, step: dict) -> None:
+    """ส่งปุ่มหลายตัวเรียงกัน เช่น keys: [TAB, TAB, ENTER]"""
+    keys = step.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise StepError("send_keys ต้องระบุ 'keys' เป็นลิสต์")
+    _, hwnd = _target(ctx, step)
+    if ctx.dry_run:
+        log.info("dry-run: จะส่งปุ่ม %s ไปยัง %s", keys, _describe(hwnd))
+        return
+    log.info("ส่งปุ่ม %s ไปยัง %s", keys, _describe(hwnd))
+    for k in keys:
+        win.send_key(hwnd, str(k))
+        time.sleep(0.08)
+
+
+@action("select_combo", ("window", "control", "value", "index"))
+def act_select_combo(ctx: Context, step: dict) -> None:
+    """เลือกค่าใน ComboBox ด้วยข้อความหรือลำดับ"""
+    _, hwnd = _target(ctx, step)
+    items = win.combo_items(hwnd)
+    if "index" in step:
+        idx = int(step["index"])
+    else:
+        value = str(step.get("value", ""))
+        if value not in items:
+            raise StepError(
+                f"ไม่พบตัวเลือก {value!r} ใน ComboBox {_describe(hwnd)}\n"
+                f"  ตัวเลือกที่มี: {items}"
+            )
+        idx = items.index(value)
+    if ctx.dry_run:
+        log.info("dry-run: จะเลือกลำดับ %d (%s) ใน %s",
+                 idx, items[idx] if idx < len(items) else "?", _describe(hwnd))
+        return
+    log.info("เลือกลำดับ %d ใน %s", idx, _describe(hwnd))
+    win.combo_select(hwnd, idx)
+
+
+# --------------------------------------------------------------- DataWindow
+
+
+def _resolve_dw(ctx: Context, step: dict) -> int:
+    window = ctx.resolve_window(step.get("window"), timeout=_timeout(ctx, step))
+    spec = step.get("datawindow", {"class_name": win.PB_DATAWINDOW_CLASS})
+    return ctx.resolve_control(window, spec, timeout=_timeout(ctx, step),
+                               key="datawindow")
+
+
+@action("dw_click", ("window", "datawindow", "at") + CHANGE_KEYS)
+def act_dw_click(ctx: Context, step: dict) -> None:
+    """คลิกที่พิกัดหนึ่งใน DataWindow (at: {x_pct, y_pct} หรือ {x, y})"""
+    hwnd = _resolve_dw(ctx, step)
+    at = step.get("at")
+    if at is None:
+        raise StepError("dw_click ต้องระบุ 'at' เช่น at: { x_pct: 0.5, y_pct: 0.78 }")
+
+    if ctx.dry_run:
+        x, y = dw.resolve_point(hwnd, at)
+        target = _resolve_watch(ctx, step) if step.get("expect_change") else None
+        log.info("dry-run: จะคลิก DataWindow %s ที่ client (%d,%d) ขนาด %s%s",
+                 hex(hwnd), x, y, win.get_client_size(hwnd),
+                 (f" พร้อมตรวจว่า {_describe(target)} เปลี่ยนจริง" if target
+                  else " พร้อมตรวจว่าหน้าจอเปลี่ยนจริง" if step.get("expect_change")
+                  else ""))
+        return
+
+    watcher = _make_watcher(ctx, step, hwnd)
+    armed = watcher.arm() if watcher else False
+
+    x, y = dw.click(hwnd, at)
+    log.info("คลิก DataWindow %s ที่ client (%d,%d)", hex(hwnd), x, y)
+
+    if armed:
+        watcher.wait(timeout=float(step.get("change_timeout", 5)),
+                     context=f"หลังคลิก DataWindow {hex(hwnd)} ที่ client ({x},{y})")
+
+
+@action("dw_click_row", ("window", "datawindow", "find", "find_x", "click_x",
+                         "click_dy", "max_mismatch") + CHANGE_KEYS)
+def act_dw_click_row(ctx: Context, step: dict) -> None:
+    """หาแถวใน DataWindow จากภาพข้อความของแถวนั้น แล้วคลิกบนแถวที่เจอ
+
+    ใช้แทน dw_click ตอนเลือกเมนูในรายการรายงาน เพราะรายการเพิ่ม/ลดแถวเองได้
+    เลขแถวตายตัวจึงพาไปกดผิดเมนู - หาไม่เจอหรือเจอหลายที่จะหยุด ไม่กดเดา
+
+    click_x คือ x ในพิกัด DataWindow, click_dy คือระยะลงมาจากขอบบนของภาพที่เจอ
+    (ไม่ใส่ = กึ่งกลางภาพ) - กล่อง +/- อยู่ค่อนไปทางบนของแถว ต้องใส่ click_dy เอง
+    """
+    from pathlib import Path
+
+    from PIL import Image
+
+    from . import rowfind
+    from .config import ROOT
+    from .shots import capture_image, is_blank
+
+    for key in ("find", "find_x", "click_x"):
+        if key not in step:
+            raise StepError(f"dw_click_row ต้องระบุ '{key}'")
+    ref_path = Path(str(step["find"]))
+    if not ref_path.is_absolute():
+        ref_path = ROOT / ref_path
+    try:
+        ref = Image.open(ref_path)
+        ref.load()
+    except OSError as exc:
+        raise StepError(f"เปิดภาพอ้างอิง {ref_path} ไม่ได้: {exc}") from exc
+
+    hwnd = _resolve_dw(ctx, step)
+    shot = capture_image(hwnd)
+    if shot is None or is_blank(shot):
+        # ไม่เห็นหน้าจอ = ไม่รู้ว่าแถวไหนเป็นแถวไหน ห้ามคลิกเดา
+        raise StepError(
+            f"ถ่ายภาพ DataWindow {hex(hwnd)} ไม่ได้ "
+            f"({'ถ่ายไม่ได้' if shot is None else 'ได้ภาพสีเดียวล้วน'}) "
+            f"จึงหาแถวของ {ref_path.name} ไม่ได้"
+        )
+
+    try:
+        mx, my, score = rowfind.find_row(
+            shot, ref, int(step["find_x"]),
+            max_mismatch=float(step.get("max_mismatch",
+                                        rowfind.DEFAULT_MAX_MISMATCH)),
+        )
+    except rowfind.RowFindError as exc:
+        saved = ctx.screenshot(hwnd, f"{step.get('name', 'row')}_dw")
+        raise StepError(
+            f"{exc}\n"
+            f"  ภาพอ้างอิง: {ref_path}\n"
+            f"  ภาพ DataWindow ตอนนี้: {saved}\n"
+            f"  ถ้าเมนูอยู่บนจอจริงแต่หน้าตาเปลี่ยน (ฟอนต์/DPI) ให้ตัดข้อความของแถวนั้น"
+            f"จากภาพ DataWindow แล้วบันทึกทับภาพอ้างอิง และแก้ find_x "
+            f"เป็นขอบซ้ายที่ตัด"
+        ) from exc
+
+    off_x, off_y = win.client_offset(hwnd)
+    x = int(step["click_x"])
+    y = my + int(step.get("click_dy", ref.size[1] // 2)) - off_y
+    row_desc = (f"แถวของ {ref_path.name} ที่ y={my - off_y} "
+                f"(คะแนน {score:.3f})")
+
+    if ctx.dry_run:
+        log.info("dry-run: เจอ%s จะคลิก DataWindow %s ที่ client (%d,%d)",
+                 row_desc, hex(hwnd), x, y)
+        return
+
+    watcher = _make_watcher(ctx, step, hwnd)
+    armed = watcher.arm() if watcher else False
+
+    log.info("เจอ%s คลิก DataWindow %s ที่ client (%d,%d)",
+             row_desc, hex(hwnd), x, y)
+    win.click_client(hwnd, x, y)
+
+    if armed:
+        watcher.wait(timeout=float(step.get("change_timeout", 5)),
+                     context=f"หลังคลิก{row_desc}")
+
+
+@action("dw_edit", ("window", "datawindow", "at", "value", "expect_edit",
+                    "method", "then_key", "verify"))
+def act_dw_edit(ctx: Context, step: dict) -> None:
+    """คลิกช่องใน DataWindow แล้วกรอกค่า (ใช้กับหน้าล็อกอิน/ฟอร์มของ PB)"""
+    hwnd = _resolve_dw(ctx, step)
+    at = step.get("at")
+    if at is None:
+        raise StepError("dw_edit ต้องระบุ 'at'")
+    value = str(step.get("value", ""))
+    expect = step.get("expect_edit")
+
+    if ctx.dry_run:
+        x, y = dw.resolve_point(hwnd, at)
+        log.info(
+            "dry-run: จะคลิก DataWindow %s ที่ (%d,%d) แล้วกรอกข้อความยาว %d ตัว "
+            "(คาดว่าช่องกรอกคือ control_id=%s)",
+            hex(hwnd), x, y, len(value), expect,
+        )
+        return
+
+    edit = dw.focus_cell(hwnd, at, expect_edit=expect,
+                         timeout=float(step.get("timeout", 8)))
+    log.info("ช่องกรอกที่ใช้งานอยู่: %s", _describe(edit))
+    dw.write_cell(edit, value, method=str(step.get("method", "settext")))
+    _verify_text(edit, value, step)
+
+    then_key = step.get("then_key")
+    if then_key:
+        log.info("ส่งปุ่ม %s เพื่อยืนยันค่า", then_key)
+        win.send_key(edit, str(then_key))
+        time.sleep(0.3)
+
+
+# --------------------------------------------------------------- ตรวจ/บันทึก
+
+
+@action("assert_text", ("window", "control", "equals", "contains", "matches"))
+def act_assert_text(ctx: Context, step: dict) -> None:
+    """ตรวจข้อความของหน้าต่างหรือ control ว่าอยู่ถูกจอ"""
+    import re
+
+    _, hwnd = _target(ctx, step)
+    text = win.get_text(hwnd)
+    if "equals" in step and text != step["equals"]:
+        raise StepError(f"ข้อความไม่ตรง: คาดว่า {step['equals']!r} แต่ได้ {text!r}")
+    if "contains" in step and str(step["contains"]) not in text:
+        raise StepError(f"ข้อความ {text!r} ไม่มีคำว่า {step['contains']!r}")
+    if "matches" in step and not re.search(str(step["matches"]), text):
+        raise StepError(f"ข้อความ {text!r} ไม่ตรง regex {step['matches']!r}")
+    log.info("ตรวจข้อความผ่าน: %r", text)
+
+
+def _record_output(ctx: Context, path) -> None:
+    """จดไฟล์ที่ flow ผลิตได้ ไว้เขียนลง logs/last_run.json"""
+    from datetime import datetime
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    entry = {
+        "path": str(path),
+        "size": stat.st_size,
+        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+    }
+    # ไฟล์เดิมถูกจดไว้แล้วก็อัปเดตแทนการเพิ่มซ้ำ
+    for existing in ctx.outputs:
+        if existing["path"] == entry["path"]:
+            existing.update(entry)
+            return
+    ctx.outputs.append(entry)
+
+
+@action("move_file", ("from", "to", "overwrite"))
+def act_move_file(ctx: Context, step: dict) -> None:
+    """ย้าย/เปลี่ยนชื่อไฟล์ - ใช้เผยแพร่ผลลัพธ์แบบปลอดภัย
+
+    รูปแบบที่แนะนำ: ส่งออกเป็นชื่อชั่วคราวก่อน ตรวจให้ผ่าน แล้วค่อยเปลี่ยนชื่อ
+    เป็นชื่อจริง ถ้า flow ล้มกลางทาง ไฟล์ชื่อจริงของรอบก่อนจะยังอยู่ครบ
+    และปลายทางจะไม่มีวันหยิบไฟล์ที่เขียนไม่เสร็จไปใช้
+    """
+    from pathlib import Path
+
+    src_raw, dst_raw = step.get("from"), step.get("to")
+    if not src_raw or not dst_raw:
+        raise StepError("move_file ต้องระบุทั้ง 'from' และ 'to'")
+    src, dst = Path(str(src_raw)), Path(str(dst_raw))
+    overwrite = bool(step.get("overwrite", True))
+
+    if ctx.dry_run:
+        log.info("dry-run: จะย้าย %s -> %s", src, dst)
+        return
+
+    if not src.exists():
+        raise StepError(
+            f"ไม่พบไฟล์ต้นทาง {src} จึงย้ายไม่ได้\n"
+            f"  ต้องมี step ที่สร้างไฟล์นี้ (และ assert_file ตรวจแล้ว) มาก่อน"
+        )
+    if dst.exists() and not overwrite:
+        raise StepError(f"ไฟล์ปลายทาง {dst} มีอยู่แล้ว และตั้ง overwrite: false ไว้")
+
+    size = src.stat().st_size
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # replace() เขียนทับได้ และเป็น atomic เมื่ออยู่ไดรฟ์เดียวกัน
+        src.replace(dst)
+    except OSError as exc:
+        raise StepError(f"ย้าย {src} ไป {dst} ไม่สำเร็จ: {exc}") from exc
+
+    log.info("เผยแพร่ไฟล์แล้ว: %s (%s ไบต์)", dst, f"{size:,}")
+    # ไฟล์ต้นทางไม่มีอยู่แล้ว ต้องถอดออกจากรายการ ไม่งั้นปลายทางอาจหยิบผิดไฟล์
+    ctx.outputs[:] = [o for o in ctx.outputs if o["path"] != str(src)]
+    _record_output(ctx, dst)
+
+
+@action("assert_file", ("path", "min_size", "max_age"))
+def act_assert_file(ctx: Context, step: dict) -> None:
+    """ตรวจว่าไฟล์ถูกเขียนจริงในรอบนี้ (ใช้ยืนยันผลการส่งออก)
+
+    รอจนไฟล์โผล่ ขนาดถึงเกณฑ์ และขนาดหยุดนิ่ง (เขียนเสร็จแล้ว)
+    max_age กันไม่ให้ไฟล์เก่าจากรอบก่อนถูกนับว่าผ่าน
+    """
+    import time as _time
+    from pathlib import Path
+
+    raw = step.get("path")
+    if not raw:
+        raise StepError("assert_file ต้องระบุ 'path'")
+    path = Path(str(raw))
+    min_size = int(step.get("min_size", 1))
+    max_age = float(step.get("max_age", 300))
+    timeout = _timeout(ctx, step)
+
+    if ctx.dry_run:
+        log.info("dry-run: จะตรวจว่ามีไฟล์ %s ขนาดอย่างน้อย %d ไบต์", path, min_size)
+        return
+
+    deadline = _time.monotonic() + timeout
+    last_size = -1
+    while True:
+        if path.exists():
+            size = path.stat().st_size
+            age = _time.time() - path.stat().st_mtime
+            if size >= min_size and size == last_size:
+                if age > max_age:
+                    raise StepError(
+                        f"เจอไฟล์ {path} แต่ถูกแก้ไขล่าสุดเมื่อ {age:.0f} วินาทีที่แล้ว "
+                        f"ซึ่งเกิน {max_age:.0f} วินาที - น่าจะเป็นไฟล์เก่าจากรอบก่อน "
+                        f"ไม่ใช่ไฟล์ที่เพิ่งส่งออก"
+                    )
+                log.info("ไฟล์พร้อมแล้ว: %s (%s ไบต์ เขียนเมื่อ %.0f วินาทีที่แล้ว)",
+                         path, f"{size:,}", age)
+                _record_output(ctx, path)
+                return
+            last_size = size
+        if _time.monotonic() >= deadline:
+            if not path.exists():
+                raise StepError(
+                    f"ไม่พบไฟล์ {path} ภายใน {timeout:.0f} วินาที\n"
+                    f"  โฟลเดอร์ปลายทาง{'มีอยู่' if path.parent.is_dir() else 'ไม่มีอยู่'}\n"
+                    f"  ตรวจว่าพิมพ์ชื่อไฟล์ลงช่อง File name ถูกต้องและกดปุ่ม Save แล้วหรือยัง"
+                )
+            raise StepError(
+                f"ไฟล์ {path} มีอยู่แต่ขนาดยังไม่นิ่งหรือเล็กเกินไป "
+                f"({path.stat().st_size:,} ไบต์ ต้องการอย่างน้อย {min_size:,})"
+            )
+        _time.sleep(0.5)
+
+
+@action("screenshot", ("window", "name"))
+def act_screenshot(ctx: Context, step: dict) -> None:
+    """บันทึกภาพหน้าต่างลงโฟลเดอร์ screenshots"""
+    hwnd = ctx.resolve_window(step.get("window"), timeout=_timeout(ctx, step))
+    ctx.screenshot(hwnd, str(step.get("name", "shot")))
+
+
+@action("dump_tree", ("window",))
+def act_dump_tree(ctx: Context, step: dict) -> None:
+    """เขียนโครงสร้าง control ของหน้าต่างลง log (ใช้ตอนดีบัก)"""
+    hwnd = ctx.resolve_window(step.get("window"), timeout=_timeout(ctx, step))
+    log.info("โครงสร้าง control ของ %s:\n%s", hex(hwnd), win.format_tree(win.tree(hwnd)))
+
+
+@action("sleep", ("seconds",))
+def act_sleep(ctx: Context, step: dict) -> None:
+    """หน่วงเวลา - ใช้ให้น้อยที่สุด ถ้ารออะไรได้ให้ใช้ wait_* แทน"""
+    seconds = float(step.get("seconds", 1))
+    log.info("หน่วง %.1f วินาที", seconds)
+    time.sleep(seconds)
+
+
+@action("run_flow", ("path",))
+def act_run_flow(ctx: Context, step: dict) -> None:
+    """เรียก flow อื่นมาทำงานต่อ เช่นเรียก login.yaml ก่อนเริ่มงานจริง"""
+    from .runner import run_flow_in_context
+
+    path = step.get("path")
+    if not path:
+        raise StepError("run_flow ต้องระบุ 'path'")
+    run_flow_in_context(ctx, path)

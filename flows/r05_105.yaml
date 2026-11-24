@@ -1,0 +1,60 @@
+# เปิดรายงาน R05.105 (อยู่ในกลุ่ม R05.1 รายละเอียดสินค้า)
+#
+# ต่อยอดจาก flows/r05_1.yaml (ล็อกอิน + ขยาย R05.1) ไม่ต้องเขียนซ้ำ
+#
+# หาแถว R05.105 จากภาพข้อความ flows/refs/r05_105.png ไม่ใช้เลขแถว (ดูเหตุผลใน
+# flows/r05_1.yaml) ถ้าขั้นก่อนหน้าไปขยายผิดกลุ่ม แถวนี้จะไม่โผล่ จึงหยุดก่อนคลิก
+#     find_x = 69   ขอบซ้ายของภาพอ้างอิงในพิกัด DataWindow (ตรงตัว "R" ของ R05.105)
+#     click_x = 150 กลางข้อความ - ห้ามคลิก x=53 เป็นไอคอนดาว (ตั้ง/ยกเลิกรายการโปรด)
+#
+# ตรวจผลที่แผงขวาใต้ title bar (top: 90) เท่านั้น - เดิมใช้ {left: 440} ซึ่งรวม
+# title bar ด้วย ปุ่มปิดหน้าต่างเปลี่ยนสีตอนเมาส์ชี้ (945 pixel) ก็หลอกให้ผ่านได้ (26/09)
+# เปิดรายงานจริงแผงขวาเปลี่ยนราว 1.4 ล้าน pixel จึงตั้งเกณฑ์ขั้นต่ำไว้ 50,000
+# (เฝ้าหัวรายงาน Button 1011 ตรง ๆ ไม่ได้ เพราะก่อนเปิดเป็นภาพสีเดียว ตัวเฝ้าจะข้ามไป)
+
+name: r05_105
+description: เปิดรายงาน R05.105
+on_error: abort
+
+steps:
+  - action: run_flow
+    name: ล็อกอินแล้วขยาย R05.1
+    path: flows/r05_1.yaml
+
+  - action: wait_window
+    name: จับหน้าจอหลักไว้อ้างอิง
+    as: main
+    timeout: 60
+    window:
+      class_name: "FNWND3125"
+      title: "Report Seniorsoft ProMaxx"
+
+  - action: dw_click_row
+    name: กดเมนู R05.105
+    window: main
+    datawindow: { class_name: "pbdw125", control_id: 1010 }
+    find: flows/refs/r05_105.png
+    find_x: 69
+    click_x: 150
+    expect_change: true
+    change_window: main
+    change_region: { left: 440, top: 90 }
+    change_min_pixels: 50000
+    change_timeout: 30
+    alert: "เลือกเมนูไม่ได้: หาเมนู R05.105 ไม่เจอหลังขยาย R05.1 - อาจขยายผิดกลุ่มหรือ ProMaxx อัปเดตหน้าตาเมนู ดูภาพที่แนบ (HOWTO ข้อ 4.2)"
+
+  - action: assert_text
+    name: ยืนยันว่าเปิด R05.105 จริง
+    window: main
+    control: { class_name: "Button", control_id: 1011 }
+    contains: "R05.105"
+    retry: { times: 6, delay: 0.5 }
+    alert: "เลือกเมนูผิด: เปิดรายงานแล้วแต่หัวรายงานไม่ใช่ R05.105 - บอทหยุดก่อนส่งออก ไฟล์เดิมยังไม่ถูกทับ"
+
+  - action: screenshot
+    name: 01_r05_105_opened
+    window: main
+
+  - action: dump_tree
+    name: ดูโครงสร้างหน้าจอหลังเปิด R05.105
+    window: main

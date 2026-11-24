@@ -1,0 +1,76 @@
+# ค่าตั้งกลางของบอท ProMaxx Report
+# แก้ไฟล์นี้ได้โดยไม่ต้องแตะโค้ด Python
+
+app:
+  exe: "C:\\SeniorSoft ProMaxx\\promaxxreport.exe"
+  # จำเป็น: PowerBuilder โหลดไฟล์ .pbd จาก working directory
+  work_dir: "C:\\SeniorSoft ProMaxx"
+  process_name: "promaxxreport.exe"
+  # PB โหลด report_condition.pbd ขนาด 15MB ตอนเปิด จึงเผื่อเวลาไว้เยอะ
+  start_timeout: 90
+  # ให้เวลาโปรแกรมปิดเองก่อน ถ้าเกินนี้จะสั่ง terminate
+  # (ค้างได้ถ้ามีกล่องเตือนค้างอยู่ จึงไม่ควรตั้งนาน)
+  close_timeout: 8
+  # title ของหน้าต่างหลักหลังล็อกอินสำเร็จ
+  main_window_title: "Report Seniorsoft ProMaxx"
+  # flow ที่รันเมื่อดับเบิลคลิก promaxx-bot.exe (ไม่มีผลตอนสั่งจาก command line)
+  default_flow: "flows/r05_105_export.yaml"
+  # ดับเบิลคลิกแล้วอัปโหลดเข้า Supabase ต่อด้วยไหม (เท่ากับใส่ --then-upload)
+  # false = export ออกไฟล์อย่างเดียว · ไม่มีผลกับ Task Scheduler ซึ่งส่ง argument มาเอง
+  #
+  # ต้องเป็น false จนกว่าจะมีตัวอัปโหลดของ R05.105 จริง -- upload-products.mjs ที่ก๊อปมา
+  # ยังเป็นของ R05.106 (ตาราง products, หัวคอลัมน์ CF_BARCODE/CF_FMLPRICE/...) ล้วน ๆ
+  default_then_upload: false
+
+paths:
+  logs: "logs"
+  screenshots: "screenshots"
+
+# ใช้เมื่อสั่ง run ... --then-upload (export เสร็จแล้วอัปเข้า Supabase ต่อ)
+upload:
+  # สคริปต์อัปโหลด อยู่โฟลเดอร์เดียวกับ .exe (หรือรากโปรเจกต์เมื่อรันด้วย python)
+  script: "upload-products.mjs"
+  # ว่างไว้ = หา node จาก PATH ก่อน แล้วค่อย C:\Program Files\nodejs\node.exe
+  node_exe: ""
+
+runner:
+  default_timeout: 30
+  poll_interval: 0.25
+  # หน่วงสั้น ๆ หลังทุก step ให้ PB ประมวลผล message ที่ส่งไป
+  step_pause: 0.2
+
+logging:
+  level: INFO
+  max_bytes: 2000000
+  backup_count: 10
+  # ค่าของตัวแปรเหล่านี้จะถูกแทนด้วย *** ในทุก log
+  mask_env:
+    - PROMAXX_PASSWORD
+    # error ของ urllib พก URL ที่มี token ติดมา ต้องปิดไว้เสมอ
+    - TELEGRAM_BOT_TOKEN
+
+# แจ้งผลทุกรอบเข้า Telegram (บอทตัวเดียวกับ EDC MONITOR)
+# token/chat อยู่ใน .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# ไม่ส่งตอน --dry-run หรือสั่ง --no-notify
+notify:
+  enabled: true
+  # ชื่อที่ขึ้นหัวข้อความ - แยกบอทแต่ละตัวในแชทเดียวกันได้
+  label: "BOTR05105 · R05.105"
+  # ส่งตอนสำเร็จด้วย: วันไหนไม่มีข้อความเลย = บอทไม่ได้รัน (เครื่องปิด/Task ไม่ทำงาน)
+  on_success: true
+  # ตอนพังส่งภาพหน้าจอตอนพัง + ภาพรายการเมนูที่ dw_click_row เห็น (ถ้ามี)
+  send_screenshot: true
+
+watchdog:
+  enabled: true
+  interval: 1.0
+  # หน้าต่างที่ "คาดหวัง" ระหว่าง flow - watchdog จะไม่ยุ่ง
+  ignore_title_re:
+    - "Report Seniorsoft ProMaxx"
+  # กติกาจัดการ dialog แปลกปลอม ตรวจตามลำดับ ใช้อันแรกที่ match
+  rules:
+    - name: "message box มาตรฐาน"
+      class_name: "#32770"
+      # dismiss = กดปุ่มตาม button_title_re / abort = หยุด flow / log = แค่บันทึกภาพ
+      policy: log
+      button_title_re: "(?i)^(ok|ตกลง|yes|ใช่)$"

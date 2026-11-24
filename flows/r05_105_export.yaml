@@ -1,0 +1,146 @@
+# ส่งออกรายงาน R05.105 เป็นไฟล์ CSV ลงโฟลเดอร์เดียวกับ R05.106 (run-upload-stock)
+#
+# ยังไม่มีตัวอัปโหลดของรายงานนี้ -- ห้ามรันด้วย --then-upload เพราะ upload-products.mjs
+# เขียนไว้สำหรับ R05.106 (ตาราง products) และหัวคอลัมน์คนละชุดกับรายงานนี้เลย
+#
+# ปุ่ม "ส่งออก" เปิด Save As dialog มาตรฐานของวินโดวส์ (#32770 title='Select File')
+# ซึ่งเป็น control จริงทั้งหมด สั่งงานด้วย locator ได้ตรง ๆ (ยืนยันแล้วจาก R14.102/R05.106)
+#     ComboBox id=1136   รูปแบบไฟล์ (Save as type)
+#     Edit     id=1152   ชื่อไฟล์ (File name) -- พิมพ์ path เต็มได้ ไม่ต้องสนช่อง Save in
+#     Button   id=1      Save
+#     Button   id=2      Cancel
+#
+# ต้องตั้งรูปแบบไฟล์ "ก่อน" พิมพ์ชื่อไฟล์ เพราะการเปลี่ยนรูปแบบจะไปแก้นามสกุล
+# ในช่องชื่อไฟล์ให้เอง
+#
+# CSV ที่ได้เป็น UTF-8 พร้อม BOM ข้อมูลเป็นข้อมูลดิบของ DataWindow ชื่อคอลัมน์เป็น
+# ชื่อฐานข้อมูลตรง ๆ (ดู bot/../logs จาก dump_tree ของ r05_105_confirm.yaml สำหรับ SQL เต็ม)
+#
+# คอลัมน์หลัก (จาก SQL ของรายงาน - ดู Edit id=1012 ตอน dump_tree):
+#   CF_ITEMS_ORDINARY, CF_ITEMID, CF_ITEMNAME, CF_BASEMULTIPLE, CF_UNITNAME,
+#   CF_LEVELNO, CF_ITEMPRICELEVEL_PRICE, CF_FMLPRICE, CF_FMLDISCOUNT,
+#   CF_FMLDISCOUNTITEM, CF_COMMENTS, CF_BOTTOMPRICE, CF_TOPPRICE,
+#   CF_SYSITEMGROUPL1ID..L5ID, CF_ITEMGROUPL1_GROUPNAME..L5_GROUPNAME,
+#   CF_ITEMGROUPL1_ORDINARY..L5_ORDINARY, CF_COMPANY
+#
+# คนละชุดกับ R05.106 -- ไม่มี CF_BARCODE ซึ่ง upload-products.mjs บังคับหาในหัวคอลัมน์
+# ถ้าเผลอสั่งอัปโหลดไฟล์นี้ด้วยสคริปต์เดิม มันจะหยุดพร้อมบอกว่าหาคอลัมน์ไม่เจอ (ตรวจ
+# หัวคอลัมน์ก่อนเขียนเสมอ) ตาราง products จึงไม่ถูกทับด้วยข้อมูลผิดชุด
+
+name: r05_105_export
+description: ส่งออกรายงาน R05.105 เป็น CSV ลงโฟลเดอร์ run-upload-stock
+on_error: abort
+
+steps:
+  - action: run_flow
+    name: ออกรายงาน R05.105 ก่อน
+    path: flows/r05_105_confirm.yaml
+
+  - action: wait_window
+    name: จับหน้าจอหลักไว้อ้างอิง
+    as: main
+    timeout: 60
+    window:
+      class_name: "FNWND3125"
+      title: "Report Seniorsoft ProMaxx"
+
+  - action: wait_control
+    name: รอให้ปุ่มส่งออกพร้อมใช้งาน
+    window: main
+    control: { class_name: "Button", title: "ส่งออก" }
+    state: enabled
+    timeout: 30
+
+  - action: click
+    name: กดปุ่มส่งออก
+    window: main
+    control: { class_name: "Button", title: "ส่งออก" }
+    method: message
+
+  - action: wait_window
+    name: รอ Save As dialog
+    as: save
+    timeout: 60
+    window:
+      class_name: "#32770"
+      title: "Select File"
+
+  - action: select_combo
+    name: เลือกรูปแบบไฟล์ CSV
+    window: save
+    control: { class_name: "ComboBox", control_id: 1136 }
+    value: "CSV Files(*.CSV)"
+
+  # ส่งออกเป็นชื่อชั่วคราว .part ก่อน แล้วค่อยเปลี่ยนชื่อเป็นชื่อจริงตอนจบ
+  - action: set_text
+    name: พิมพ์ path ปลายทางชั่วคราว
+    window: save
+    control: { class_name: "Edit", control_id: 1152 }
+    value: "${USERPROFILE}\\Desktop\\run-upload-stock\\ADJ_R05105.part.CSV"
+
+  - action: click
+    name: กดปุ่ม Save
+    window: save
+    control: { class_name: "Button", control_id: 1 }
+    method: bm
+
+  # รอบที่ 2 เป็นต้นไปไฟล์จะมีอยู่แล้ว วินโดวส์จะถามยืนยันเขียนทับ
+  - action: click
+    name: ยืนยันเขียนทับไฟล์เดิม (ถ้ามี)
+    optional: true
+    timeout: 4
+    window:
+      class_name: "#32770"
+      has_child: { class_name: "Button", control_id: 6 }
+    control: { class_name: "Button", control_id: 6 }
+    method: bm
+
+  - action: wait_window_gone
+    name: รอ Save As dialog ปิด
+    window: save
+    timeout: 180
+
+  - action: wait_window
+    name: รอกล่องแจ้งผลการส่งออก
+    as: done
+    timeout: 180
+    window:
+      class_name: "#32770"
+      title: "SeniorSoft ProMaxx"
+
+  - action: assert_text
+    name: ยืนยันว่าโปรแกรมบอกว่าสำเร็จ
+    window: done
+    control: { class_name: "Static", control_id: 65535 }
+    contains: "สำเร็จ"
+
+  - action: click
+    name: ปิดกล่องแจ้งผล
+    window: done
+    control: { class_name: "Button", control_id: 2 }
+    method: bm
+
+  - action: wait_window_gone
+    name: รอกล่องแจ้งผลปิด
+    window: done
+    timeout: 30
+
+  - action: assert_file
+    name: ตรวจว่าไฟล์ชั่วคราวถูกเขียนจริง
+    path: "${USERPROFILE}\\Desktop\\run-upload-stock\\ADJ_R05105.part.CSV"
+    min_size: 10000
+    max_age: 300
+    timeout: 180
+
+  - action: move_file
+    name: เปลี่ยนชื่อเป็นไฟล์จริง
+    from: "${USERPROFILE}\\Desktop\\run-upload-stock\\ADJ_R05105.part.CSV"
+    to: "${USERPROFILE}\\Desktop\\run-upload-stock\\ADJ_R05105.CSV"
+
+  - action: screenshot
+    name: 01_after_export
+    window: main
+
+  # ปิดโปรแกรมเมื่อจบงาน - ต้องอยู่หลัง assert_file และ screenshot
+  - action: stop_app
+    name: ปิดโปรแกรม ProMaxx
